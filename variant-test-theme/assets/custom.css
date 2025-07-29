@@ -1,0 +1,26 @@
+
+.hide-swatch{
+    display: none !important;
+}
+
+.mt-1 {
+    margin-top: 1rem;
+}
+
+.text-uppercase{
+    text-transform: uppercase;
+}
+
+
+/* input[checked="checked"]+.color-swatch{
+    --swatch-disabled-margin: 0;
+    --swatch-disabled-strike-color: currentColor;
+    border-color: currentColor;
+} */
+
+
+
+.variant-picker__option-values .color-swatch{
+    pointer-events: all;
+
+}
