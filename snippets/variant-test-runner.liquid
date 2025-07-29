@@ -1,0 +1,1204 @@
+<!-- snippets/growthbook-unified.liquid -->
+<script>
+(function() {
+  // ============================================
+  // CONFIGURATION - CHANGE THIS FOR EACH STORE
+  // ============================================
+  const SHOP_NAME = "{{ shop.metafields.custom.variant_feature_flag }}";
+  const SDK_KEY = "{{ shop.metafields.custom.variant_sdk_key }}";
+  const PROJECT_ID = "{{ shop.metafields.custom.variant_project_id }}";
+  
+  // ============================================
+  // UNIFIED GROWTHBOOK + VARIANT RUNNER SCRIPT
+  // ============================================
+  
+  // Global debug mode flag
+  const urlParams = new URLSearchParams(window.location.search);
+  const debugMode = urlParams.get('gb-debug') === 'true' || window.localStorage.getItem('gb_debug') === 'true';
+  
+  if (debugMode) {
+    console.log('[GrowthBook] Starting unified initialization...');
+    console.log('[GrowthBook] Shop name:', SHOP_NAME);
+  }
+  
+  // Performance tracking
+  if (window.performance && window.performance.mark) {
+    window.performance.mark('gb-init-start');
+  }
+  
+  // User tracking data
+  const now = new Date();
+  const currentVisit = now.toISOString();
+  let visitCount = parseInt(localStorage.getItem('gb_visit_count') || '0') + 1;
+  let firstVisitDate = localStorage.getItem('gb_first_visit_date');
+  
+  if (!firstVisitDate) {
+    firstVisitDate = currentVisit;
+    localStorage.setItem('gb_first_visit_date', firstVisitDate);
+  }
+  
+  localStorage.setItem('gb_visit_count', visitCount.toString());
+  localStorage.setItem('gb_last_visit_date', currentVisit);
+  
+  const daysSinceFirstVisit = Math.floor(
+    (now.getTime() - new Date(firstVisitDate).getTime()) / (1000 * 60 * 60 * 24)
+  );
+  
+  // ============================================
+  // VARIANT RUNNER FUNCTIONS (Defined early)
+  // ============================================
+  
+  // Track which experiments have been applied
+  const appliedExperiments = new Set();
+  
+  // MongoDB condition evaluator
+  function evaluateMongoCondition(condition, attributes) {
+    if (!condition || typeof condition !== 'object') return true;
+    
+    if (condition.$and) {
+      return condition.$and.every(subCondition => 
+        evaluateMongoCondition(subCondition, attributes)
+      );
+    }
+    
+    if (condition.$or) {
+      return condition.$or.some(subCondition => 
+        evaluateMongoCondition(subCondition, attributes)
+      );
+    }
+    
+    if (condition.$not) {
+      return !evaluateMongoCondition(condition.$not, attributes);
+    }
+    
+    for (const [field, value] of Object.entries(condition)) {
+      if (field.startsWith('$')) continue;
+      
+      const attrValue = attributes[field];
+      
+      if (typeof value === 'object' && value !== null && !Array.isArray(value)) {
+        for (const [operator, operand] of Object.entries(value)) {
+          if (!evaluateOperator(operator, attrValue, operand)) {
+            return false;
+          }
+        }
+      } else {
+        if (attrValue !== value) {
+          return false;
+        }
+      }
+    }
+    
+    return true;
+  }
+  
+  function evaluateOperator(operator, value, operand) {
+    switch (operator) {
+      case '$eq': return value === operand;
+      case '$ne': return value !== operand;
+      case '$gt': return value > operand;
+      case '$gte': return value >= operand;
+      case '$lt': return value < operand;
+      case '$lte': return value <= operand;
+      case '$in': return Array.isArray(operand) ? operand.includes(value) : false;
+      case '$nin': return Array.isArray(operand) ? !operand.includes(value) : true;
+      case '$regex':
+        try {
+          const regex = new RegExp(operand, 'i');
+          return regex.test(String(value));
+        } catch (e) {
+          console.error('[Variant Runner] Invalid regex:', operand, e);
+          return false;
+        }
+      case '$exists':
+        const exists = value !== undefined && value !== null;
+        return operand ? exists : !exists;
+      case '$type': return typeof value === operand;
+      case '$all':
+        if (Array.isArray(value) && Array.isArray(operand)) {
+          return operand.every(item => value.includes(item));
+        }
+        return false;
+      case '$elemMatch':
+        if (Array.isArray(value)) {
+          return value.some(item => evaluateMongoCondition(operand, { value: item }));
+        }
+        return false;
+      case '$size':
+        if (Array.isArray(value)) {
+          return value.length === operand;
+        }
+        return false;
+      default:
+        console.warn('[Variant Runner] Unknown operator:', operator);
+        return true;
+    }
+  }
+  
+  // Enhanced targeting function that returns detailed exclusion reasons
+  function evaluateTargeting(targeting) {
+    if (!targeting) return { passes: true, reason: null };
+    
+    const attributes = window.gb.getAttributes();
+    
+    // Check device targeting
+    if (targeting.targetDevices && targeting.targetDevices.length > 0) {
+      if (!targeting.targetDevices.includes(attributes.deviceType)) {
+        if (debugMode) {
+          console.log('[Variant Runner Debug] Device not targeted:', attributes.deviceType, 'not in', targeting.targetDevices);
+        }
+        return { passes: false, reason: 'device_type' };
+      }
+    }
+    
+    // Check audience type targeting
+    if (targeting.audienceType && targeting.audienceType !== 'all') {
+      switch (targeting.audienceType) {
+        case 'new':
+          if (attributes.isReturningUser) {
+            if (debugMode) {
+              console.log('[Variant Runner Debug] User is returning, but targeting new users only');
+            }
+            return { passes: false, reason: 'new_user' };
+          }
+          break;
+        case 'returning':
+        case 'customers':
+          if (!attributes.isReturningUser) {
+            if (debugMode) {
+              console.log('[Variant Runner Debug] User is new, but targeting returning users only');
+            }
+            return { passes: false, reason: 'returning_user' };
+          }
+          break;
+      }
+    }
+    
+    // Check advanced targeting
+    if (targeting.advancedTargeting && targeting.advancedTargeting.enabled) {
+      let mongoCondition;
+      
+      if (typeof targeting.advancedTargeting.condition === 'string') {
+        try {
+          mongoCondition = JSON.parse(targeting.advancedTargeting.condition);
+        } catch (e) {
+          console.error('[Variant Runner] Invalid JSON in advanced targeting condition:', e);
+          return { passes: true, reason: null };
+        }
+      } else {
+        mongoCondition = targeting.advancedTargeting.condition;
+      }
+      
+      if (debugMode) {
+        console.log('[Variant Runner Debug] Evaluating advanced targeting:', mongoCondition);
+        console.log('[Variant Runner Debug] User attributes:', attributes);
+      }
+      
+      const result = evaluateMongoCondition(mongoCondition, attributes);
+      
+      if (debugMode) {
+        console.log('[Variant Runner Debug] Advanced targeting result:', result);
+      }
+      
+      if (!result) {
+        return { passes: false, reason: 'advanced_targeting' };
+      }
+    }
+    
+    return { passes: true, reason: null };
+  }
+  
+  // Legacy function for backward compatibility
+  function shouldTargetUser(targeting) {
+    return evaluateTargeting(targeting).passes;
+  }
+  
+  function waitForElement(selector, callback, timeout = 10000) {
+    const startTime = Date.now();
+    
+    try {
+      document.querySelector(selector);
+    } catch (e) {
+      console.error('[Variant Runner] Invalid selector:', selector, e);
+      return;
+    }
+    
+    const element = document.querySelector(selector);
+    if (element) {
+      callback(element);
+      return;
+    }
+    
+    const observer = new MutationObserver(function(mutations, obs) {
+      const element = document.querySelector(selector);
+      if (element) {
+        obs.disconnect();
+        callback(element);
+      } else if (Date.now() - startTime > timeout) {
+        obs.disconnect();
+        console.warn('[Variant Runner] Element not found within timeout:', selector);
+        
+        window.dispatchEvent(new CustomEvent('variant:timeout', {
+          detail: { selector: selector, timeout: timeout }
+        }));
+      }
+    });
+    
+    observer.observe(document.body, {
+      childList: true,
+      subtree: true
+    });
+    
+    setTimeout(() => observer.disconnect(), timeout);
+  }
+  
+  function captureOriginalValue(element, config, variantId) {
+    let action;
+    
+    if (config.variants && config.variants[variantId]) {
+      action = config.variants[variantId].action;
+    } else {
+      action = config.action;
+    }
+      
+    switch(action) {
+      case 'text': return element.textContent;
+      case 'html': return element.innerHTML;
+      case 'style': return element.style.cssText;
+      case 'addClass':
+      case 'removeClass': return Array.from(element.classList);
+      case 'attribute':
+        const attr = config.variants && config.variants[variantId] 
+          ? config.variants[variantId].attribute 
+          : config.attribute;
+        return element.getAttribute(attr);
+      default: return null;
+    }
+  }
+  
+  function applyExperiment(experimentId, config, variantId, isForced) {
+    try {
+      console.log('[Variant Runner] Applying experiment:', experimentId, 'variant:', variantId, isForced ? '(forced)' : '');
+      
+      let selector = config.selector;
+      let jsCode = null;
+      
+      if (config.variants && config.variants[variantId]) {
+        const variant = config.variants[variantId];
+        jsCode = variant.jsCode;
+        
+        if (jsCode && variantId !== 0) {
+          console.log('[Variant Runner] Executing JavaScript code for variant:', variantId);
+          try {
+            const executeCode = new Function(jsCode);
+            executeCode();
+            
+            window.dispatchEvent(new CustomEvent('variant:applied', {
+              detail: {
+                experimentId: experimentId,
+                variationId: variantId,
+                config: config,
+                element: null,
+                isForced: isForced,
+                type: 'code'
+              }
+            }));
+            
+            console.log('[Variant Runner] Successfully executed code for experiment:', experimentId);
+          } catch (codeError) {
+            console.error('[Variant Runner] Error executing JavaScript code:', codeError);
+            window.dispatchEvent(new CustomEvent('variant:error', {
+              detail: {
+                experimentId: experimentId,
+                error: codeError.toString(),
+                config: config,
+                type: 'code_execution'
+              }
+            }));
+          }
+          return;
+        } else if (variantId === 0) {
+          console.log('[Variant Runner] Control variant for code experiment - no code executed');
+          window.dispatchEvent(new CustomEvent('variant:applied', {
+            detail: {
+              experimentId: experimentId,
+              variationId: 0,
+              config: config,
+              element: null,
+              isForced: isForced,
+              type: 'code'
+            }
+          }));
+          return;
+        }
+      }
+      
+      if (!selector) {
+        console.warn('[Variant Runner] No selector or code for experiment:', experimentId);
+        return;
+      }
+      
+      const waitStartTime = Date.now();
+      
+      waitForElement(selector, function(element) {
+        const waitTime = Date.now() - waitStartTime;
+        
+        if (debugMode) {
+          console.log('[Variant Runner Debug] Element found after', waitTime + 'ms:', selector);
+        }
+        
+        if (!element.hasAttribute('data-variant-original')) {
+          const originalValue = captureOriginalValue(element, config, variantId);
+          element.setAttribute('data-variant-original', JSON.stringify(originalValue));
+        }
+        
+        if (variantId !== 0) {
+          let variantConfig;
+          
+          if (config.variants && config.variants[variantId]) {
+            variantConfig = config.variants[variantId];
+          } else {
+            variantConfig = {
+              action: config.action,
+              value: config.value,
+              attribute: config.attribute
+            };
+          }
+          
+          if (!variantConfig || (!variantConfig.action && !variantConfig.value)) {
+            console.log('[Variant Runner] No configuration for variant', variantId);
+            return;
+          }
+          
+          switch(variantConfig.action) {
+            case 'text':
+              element.textContent = variantConfig.value;
+              break;
+            case 'html':
+              element.innerHTML = variantConfig.value;
+              break;
+            case 'style':
+              if (typeof variantConfig.value === 'object') {
+                Object.assign(element.style, variantConfig.value);
+              } else {
+                element.style.cssText = variantConfig.value;
+              }
+              break;
+            case 'addClass':
+              element.classList.add(...variantConfig.value.split(' '));
+              break;
+            case 'removeClass':
+              element.classList.remove(...variantConfig.value.split(' '));
+              break;
+            case 'attribute':
+              if (variantConfig.attribute && variantConfig.value !== undefined) {
+                element.setAttribute(variantConfig.attribute, variantConfig.value);
+              }
+              break;
+            case 'remove':
+              element.style.display = 'none';
+              element.setAttribute('data-variant-removed', 'true');
+              break;
+            case 'custom':
+              try {
+                const customFunction = new Function('element', 'config', variantConfig.value);
+                customFunction(element, config);
+              } catch (customError) {
+                console.error('[Variant Runner] Custom function error:', customError);
+              }
+              break;
+            default:
+              console.warn('[Variant Runner] Unknown action:', variantConfig.action);
+          }
+          
+          element.setAttribute('data-variant-experiment', experimentId);
+          element.setAttribute('data-variant-action', variantConfig.action || 'modified');
+          element.setAttribute('data-variant-applied', new Date().toISOString());
+          element.setAttribute('data-variant-id', variantId.toString());
+          element.setAttribute('data-gb-experiment', experimentId);
+          
+          if (isForced) {
+            element.setAttribute('data-variant-forced', 'true');
+          }
+          
+          console.log('[Variant Runner] Successfully applied changes for:', selector);
+        } else {
+          element.setAttribute('data-variant-experiment', experimentId);
+          element.setAttribute('data-variant-action', 'control');
+          element.setAttribute('data-variant-applied', new Date().toISOString());
+          element.setAttribute('data-variant-id', '0');
+          element.setAttribute('data-gb-experiment', experimentId);
+          element.setAttribute('data-variant-control', 'true');
+          
+          if (isForced) {
+            element.setAttribute('data-variant-forced', 'true');
+          }
+          
+          if (debugMode) {
+            console.log('[Variant Runner Debug] Control variant - no visual changes applied');
+          }
+          
+          console.log('[Variant Runner] Successfully marked control for:', selector);
+        }
+        
+        window.dispatchEvent(new CustomEvent('variant:applied', {
+          detail: {
+            experimentId: experimentId,
+            variationId: variantId,
+            config: config,
+            element: element,
+            isForced: isForced,
+            waitTime: waitTime,
+            type: 'element'
+          }
+        }));
+        
+      }, config.timeout || 10000);
+      
+    } catch (error) {
+      console.error('[Variant Runner] Error applying experiment:', experimentId, error);
+      
+      window.dispatchEvent(new CustomEvent('variant:error', {
+        detail: {
+          experimentId: experimentId,
+          error: error.toString(),
+          config: config
+        }
+      }));
+    }
+  }
+  
+  // Extract preview parameters from URL
+  function extractPreviewParams() {
+    const previewExperiments = [];
+    
+    for (const [key, value] of urlParams.entries()) {
+      // Look for gb_SHOP-EXP### or gb_EXP### patterns
+      const match = key.match(/^gb_(.+-EXP\d+|EXP\d+)$/);
+      if (match) {
+        const experimentId = match[1];
+        
+        // If it's just EXP###, prepend shop name
+        const fullExperimentId = experimentId.startsWith('EXP') 
+          ? `${SHOP_NAME}-${experimentId}`
+          : experimentId;
+          
+        // ✅ FIXED: Parse variant ID as integer (supports 0, 1, 2, 3, etc.)
+        const variantId = parseInt(value) || 0;
+          
+        previewExperiments.push({
+          experimentId: fullExperimentId,
+          variantId: variantId,  // Now supports any variant number
+          isPreview: true
+        });
+        
+        if (debugMode) {
+          console.log('[Variant Runner Debug] Found preview parameter:', fullExperimentId, 'variant:', variantId);
+        }
+      }
+    }
+    
+    return previewExperiments;
+  }
+  
+  // Get all individual experiment feature flags for this shop
+  async function getShopExperimentFeatureFlags() {
+    const features = window.gb.getFeatures();
+    const shopFeatureFlags = {};
+    
+    // Find all feature flags matching the shop pattern: {SHOP_NAME}-EXP###
+    Object.keys(features).forEach(featureId => {
+      if (featureId.startsWith(`${SHOP_NAME}-EXP`)) {
+        const config = window.gb.getFeatureValue(featureId, null);
+        if (config) {
+          shopFeatureFlags[featureId] = config;
+        }
+      }
+    });
+    
+    if (debugMode) {
+      console.log('[Variant Runner Debug] Found shop experiment feature flags:', Object.keys(shopFeatureFlags));
+    }
+    
+    return shopFeatureFlags;
+  }
+  
+  // Fetch individual feature flags for experiments
+  async function fetchExperimentFeatureFlags(experimentsList) {
+    const configs = {};
+    
+    if (debugMode) {
+      console.log('[Variant Runner Debug] Fetching feature flags for experiments:', experimentsList.map(e => e.experimentId));
+    }
+    
+    // Create promises for parallel loading
+    const fetchPromises = experimentsList.map(async (experiment) => {
+      try {
+        const featureFlagId = experiment.experimentId;
+        
+        if (debugMode) {
+          console.log('[Variant Runner Debug] Fetching feature flag:', featureFlagId);
+        }
+        
+        const config = window.gb.getFeatureValue(featureFlagId, null);
+        
+        if (config) {
+          configs[experiment.experimentId] = {
+            ...config,
+            gbExperimentId: experiment.gbExperimentId,
+            coverage: experiment.coverage,
+            isRunning: experiment.isRunning,
+            isPreview: experiment.isPreview || false
+          };
+          
+          if (debugMode) {
+            console.log('[Variant Runner Debug] Loaded config for:', featureFlagId);
+          }
+        } else {
+          console.warn('[Variant Runner] No feature flag found for experiment:', featureFlagId);
+        }
+        
+      } catch (error) {
+        console.error('[Variant Runner] Error fetching feature flag for experiment:', experiment.experimentId, error);
+      }
+    });
+    
+    // Wait for all feature flags to load
+    await Promise.all(fetchPromises);
+    
+    if (debugMode) {
+      console.log('[Variant Runner Debug] Loaded feature flag configs:', Object.keys(configs).length);
+    }
+    
+    return configs;
+  }
+  
+  // Apply completed experiments (permanent changes)
+  function applyCompletedExperiments(configs) {
+    let appliedCount = 0;
+    
+    Object.keys(configs).forEach(experimentId => {
+      const config = configs[experimentId];
+      
+      // Check if experiment is completed and enabled
+      if (config.status === 'completed' && config.enabled === true) {
+        const winningVariantIndex = config.winningVariant || 1;
+        
+        if (debugMode) {
+          console.log('[Variant Runner Debug] Applying completed experiment:', experimentId, 'winning variant:', winningVariantIndex);
+        }
+        
+        // Apply the winning variant as permanent change
+        applyExperiment(experimentId, config, winningVariantIndex, false);
+        appliedExperiments.add(experimentId);
+        appliedCount++;
+        
+        // Dispatch completed experiment event
+        window.dispatchEvent(new CustomEvent('variant:completed', {
+          detail: {
+            experimentId: experimentId,
+            winningVariant: winningVariantIndex,
+            config: config
+          }
+        }));
+      }
+    });
+    
+    if (appliedCount > 0) {
+      console.log('[Variant Runner] Applied', appliedCount, 'completed experiments');
+    }
+    
+    return appliedCount;
+  }
+  
+  async function initVariantTests() {
+    if (!window.gb || !window.gb.getFeatures) {
+      console.error('[Variant Runner] GrowthBook not ready when variant runner initialized');
+      return;
+    }
+    
+    console.log('[Variant Runner] GrowthBook ready, initializing experiments...');
+    
+    const projectId = PROJECT_ID;
+    
+    if (debugMode) {
+      console.log('[Variant Runner Debug] Project ID:', projectId);
+      console.log('[Variant Runner Debug] Shop name:', SHOP_NAME);
+      console.log('[Variant Runner Debug] User attributes:', window.gb.getAttributes());
+    }
+    
+    try {
+      // STEP 1: Extract preview experiments from URL parameters
+      const previewExperiments = extractPreviewParams();
+      
+      // STEP 2: Get all shop experiment feature flags
+      const allShopExperiments = await getShopExperimentFeatureFlags();
+      
+      if (debugMode) {
+        console.log('[Variant Runner Debug] Preview experiments:', previewExperiments.length);
+        console.log('[Variant Runner Debug] Shop experiments found:', Object.keys(allShopExperiments).length);
+      }
+      
+      if (Object.keys(allShopExperiments).length === 0 && previewExperiments.length === 0) {
+        console.log('[Variant Runner] No experiments found for this shop');
+        document.dispatchEvent(new CustomEvent('variant:ready', {
+          detail: { 
+            experimentsFound: 0,
+            experimentsApplied: 0,
+            completedApplied: 0,
+            projectId: projectId,
+            shopName: SHOP_NAME
+          }
+        }));
+        return;
+      }
+      
+      // Combine all experiments (shop experiments + preview experiments)
+      const experimentConfigs = { ...allShopExperiments };
+      
+      // Add preview experiments (fetch their feature flags even if not in shop list)
+      for (const preview of previewExperiments) {
+        if (!experimentConfigs[preview.experimentId]) {
+          const config = window.gb.getFeatureValue(preview.experimentId, null);
+          if (config) {
+            experimentConfigs[preview.experimentId] = {
+              ...config,
+              isPreview: true
+            };
+          }
+        }
+      }
+      
+      console.log('[Variant Runner] Loaded', Object.keys(experimentConfigs).length, 'experiment configurations');
+      
+      // STEP 3: Apply completed experiments first (permanent changes)
+      const completedApplied = applyCompletedExperiments(experimentConfigs);
+      
+      // STEP 4: Process active experiments
+      const appliedExperimentsList = [];
+      
+      Object.keys(experimentConfigs).forEach(experimentId => {
+        const config = experimentConfigs[experimentId];
+        
+        if (debugMode) {
+          console.log('[Variant Runner Debug] Processing experiment:', experimentId);
+          console.log('[Variant Runner Debug] Config:', config);
+        }
+        
+        if (appliedExperiments.has(experimentId)) {
+          if (debugMode) {
+            console.log('[Variant Runner Debug] Already applied (completed), skipping:', experimentId);
+          }
+          return;
+        }
+        
+        // Check for preview mode
+        const previewExperiment = previewExperiments.find(p => p.experimentId === experimentId);
+        const isPreview = previewExperiment !== undefined;
+        
+        if (isPreview && previewExperiment) {
+          // Apply preview variant regardless of other conditions
+          const variantId = previewExperiment.variantId;
+          
+          if (debugMode) {
+            console.log('[Variant Runner Debug] Applying preview experiment:', experimentId, 'variant:', variantId);
+          }
+          
+          applyExperiment(experimentId, config, variantId, true);
+          appliedExperimentsList.push({
+            experimentId: experimentId,
+            variationId: variantId,
+            forced: true,
+            isPreview: true,
+            config: config
+          });
+          
+          appliedExperiments.add(experimentId);
+          return;
+        }
+        
+        // Skip if experiment is completed (already handled above)
+        if (config.status === 'completed') {
+          return;
+        }
+        
+        // Skip if not enabled for running experiments
+        if (config.enabled !== true) {
+          if (debugMode) {
+            console.log('[Variant Runner Debug] Experiment not enabled, skipping:', experimentId);
+          }
+          return;
+        }
+        
+        // Check targeting
+        if (!shouldTargetUser(config.targeting)) {
+          if (debugMode) {
+            console.log('[Variant Runner Debug] User does not match targeting criteria, skipping:', experimentId);
+          }
+          return;
+        }
+        
+        // ✅ FIXED: Calculate number of variants dynamically from config
+        let numVariants = 2; // Default fallback
+        
+        if (config.variants && Array.isArray(config.variants)) {
+          numVariants = config.variants.length;
+        } else if (config.variants && typeof config.variants === 'object') {
+          // Handle object format: {0: {...}, 1: {...}, 2: {...}}
+          const variantKeys = Object.keys(config.variants).map(Number).filter(n => !isNaN(n));
+          if (variantKeys.length > 0) {
+            numVariants = Math.max(...variantKeys) + 1;
+          }
+        }
+        
+        // Create variations array [0, 1, 2, 3, ...] based on actual number of variants
+        const variations = Array.from({length: numVariants}, (_, i) => i);
+        
+        if (debugMode) {
+          console.log('[Variant Runner Debug] Experiment has', numVariants, 'variants:', variations);
+        }
+        
+        // ✅ FIXED: Use dynamic variations array instead of hardcoded [0, 1]
+        const result = window.gb.run({
+          key: experimentId,
+          variations: variations
+        });
+        
+        if (debugMode) {
+          console.log('[Variant Runner Debug] Assignment result for', experimentId + ':', {
+            inExperiment: result.inExperiment,
+            variationId: result.variationId,
+            bucket: result.bucket,
+            hashValue: result.hashValue,
+            totalVariations: variations.length
+          });
+        }
+        
+        if (result.inExperiment) {
+          applyExperiment(experimentId, config, result.variationId, false);
+          appliedExperimentsList.push({
+            experimentId: experimentId,
+            variationId: result.variationId,
+            forced: false,
+            isPreview: false,
+            config: config
+          });
+          
+          appliedExperiments.add(experimentId);
+        }
+      });
+      
+      console.log('[Variant Runner] Applied', appliedExperimentsList.length, 'active experiments');
+      
+      document.dispatchEvent(new CustomEvent('variant:ready', {
+        detail: {
+          experimentsFound: Object.keys(experimentConfigs).length,
+          experimentsApplied: appliedExperimentsList.length,
+          completedApplied: completedApplied,
+          applied: appliedExperimentsList,
+          projectId: projectId,
+          shopName: SHOP_NAME
+        }
+      }));
+      
+    } catch (error) {
+      console.error('[Variant Runner] Error during initialization:', error);
+      
+      document.dispatchEvent(new CustomEvent('variant:error', {
+        detail: {
+          error: error.toString(),
+          type: 'initialization'
+        }
+      }));
+    }
+  }
+  
+  // ============================================
+  // GROWTHBOOK INITIALIZATION
+  // ============================================
+  
+  const script = document.createElement('script');
+  script.src = 'https://cdn.jsdelivr.net/npm/@growthbook/growthbook/dist/bundles/index.min.js';
+  
+  script.onload = function() {
+    if (debugMode) {
+      console.log('[GrowthBook Debug] SDK script loaded successfully');
+    }
+    
+    if (window.growthbook && window.growthbook.GrowthBook) {
+      window._gbInitTime = Date.now();
+      
+      const projectId = PROJECT_ID;
+      
+      if (debugMode) {
+        console.log('[GrowthBook Debug] Project ID:', projectId);
+        console.log('[GrowthBook Debug] Shop name (feature flag):', SHOP_NAME);
+        console.log('[GrowthBook Debug] Shop domain:', "{{ shop.domain }}");
+      }
+      
+      // UTM parameters
+      const utmSource = urlParams.get('utm_source') || sessionStorage.getItem('gb_utm_source') || '';
+      const utmMedium = urlParams.get('utm_medium') || sessionStorage.getItem('gb_utm_medium') || '';
+      const utmCampaign = urlParams.get('utm_campaign') || sessionStorage.getItem('gb_utm_campaign') || '';
+      const utmTerm = urlParams.get('utm_term') || sessionStorage.getItem('gb_utm_term') || '';
+      const utmContent = urlParams.get('utm_content') || sessionStorage.getItem('gb_utm_content') || '';
+      
+      if (utmSource) sessionStorage.setItem('gb_utm_source', utmSource);
+      if (utmMedium) sessionStorage.setItem('gb_utm_medium', utmMedium);
+      if (utmCampaign) sessionStorage.setItem('gb_utm_campaign', utmCampaign);
+      if (utmTerm) sessionStorage.setItem('gb_utm_term', utmTerm);
+      if (utmContent) sessionStorage.setItem('gb_utm_content', utmContent);
+      
+      const getBrowser = function() {
+        const userAgent = navigator.userAgent.toLowerCase();
+        if (userAgent.includes('edg')) return 'edge';
+        if (userAgent.includes('chrome') && !userAgent.includes('edg')) return 'chrome';
+        if (userAgent.includes('firefox')) return 'firefox';
+        if (userAgent.includes('safari') && !userAgent.includes('chrome')) return 'safari';
+        return 'unknown';
+      };
+      
+      window.gb = new window.growthbook.GrowthBook({
+        clientKey: SDK_KEY,
+        attributes: {
+          id: (function() {
+            let userId;
+            {% if customer %}
+              userId = "customer_{{ customer.id }}";
+              if (debugMode) console.log('[GrowthBook Debug] Using customer ID:', userId);
+            {% elsif cart.token %}
+              userId = "cart_{{ cart.token }}";
+              if (debugMode) console.log('[GrowthBook Debug] Using cart token:', userId);
+            {% else %}
+              let anonId = localStorage.getItem('gb_anonymous_id');
+              if (!anonId) {
+                anonId = 'anon_' + Math.random().toString(36).substr(2, 9) + '_' + Date.now();
+                localStorage.setItem('gb_anonymous_id', anonId);
+                if (debugMode) console.log('[GrowthBook Debug] Generated new anonymous ID:', anonId);
+              } else {
+                if (debugMode) console.log('[GrowthBook Debug] Using existing anonymous ID:', anonId);
+              }
+              userId = anonId;
+            {% endif %}
+            return userId;
+          })(),
+          url: window.location.href,
+          path: window.location.pathname,
+          host: window.location.hostname,
+          query: window.location.search,
+          deviceType: /mobile/i.test(navigator.userAgent) ? 'mobile' : 'desktop',
+          browser: getBrowser(),
+          utmSource: utmSource,
+          utmMedium: utmMedium,
+          utmCampaign: utmCampaign,
+          utmTerm: utmTerm,
+          utmContent: utmContent,
+          visitCount: visitCount,
+          isReturningUser: visitCount > 1,
+          daysSinceFirstVisit: daysSinceFirstVisit,
+          page: "{{ request.page_type | default: 'unknown' }}",
+          projectId: projectId,
+          shopName: SHOP_NAME,
+          shopDomain: "{{ shop.domain }}",
+          timestamp: new Date().toISOString(),
+          referrer: document.referrer,
+          userAgent: navigator.userAgent
+        },
+        trackingCallback: function(experiment, result) {
+          if (debugMode) {
+            console.log('[GrowthBook Debug] Experiment viewed:', {
+              key: experiment.key,
+              variationId: result.variationId,
+              variationName: result.value,
+              inExperiment: result.inExperiment,
+              hashAttribute: result.hashAttribute,
+              hashValue: result.hashValue,
+              bucket: result.bucket
+            });
+          }
+          
+          if (!window.gbTestAssignments) {
+            window.gbTestAssignments = {};
+          }
+          
+          // Enhanced assignment tracking with inclusion fields
+          window.gbTestAssignments[experiment.key] = {
+            experimentId: experiment.key,
+            variationId: result.variationId,
+            variationValue: result.value,
+            inExperiment: result.inExperiment,
+            included: result.inExperiment,
+            exclusion_reason: null,
+            bucket: result.bucket,
+            timestamp: new Date().toISOString(),
+            page: "{{ request.page_type }}",
+            url: window.location.href
+          };
+          
+          try {
+            localStorage.setItem('gb_active_tests', JSON.stringify(window.gbTestAssignments));
+            localStorage.setItem('gb_last_exposure_' + experiment.key, new Date().toISOString());
+          } catch (e) {
+            console.error('[GrowthBook] Storage error:', e);
+          }
+          
+          window.dispatchEvent(new CustomEvent('growthbook:track', {
+            detail: {
+              experiment: experiment.key,
+              variation: result.variationId,
+              result: result
+            }
+          }));
+        },
+        isDevelopment: debugMode
+      });
+      
+      // Add debug helper
+      window.gb.debug = function() {
+        const context = window.gb.getContext();
+        const features = window.gb.getFeatures();
+        const attributes = window.gb.getAttributes();
+        
+        console.group('🔍 GrowthBook Debug Information');
+        console.log('Initialization Time:', new Date(window._gbInitTime).toLocaleString());
+        console.log('Time Since Init:', ((Date.now() - window._gbInitTime) / 1000).toFixed(2) + 's');
+        console.log('Client Key:', context.clientKey);
+        console.log('Project ID:', attributes.projectId);
+        console.log('Shop Name:', attributes.shopName);
+        console.log('User ID:', attributes.id);
+        console.log('Device Type:', attributes.deviceType);
+        console.log('Browser:', attributes.browser);
+        console.log('Visit Count:', attributes.visitCount);
+        console.log('Is Returning User:', attributes.isReturningUser);
+        console.log('Days Since First Visit:', attributes.daysSinceFirstVisit);
+        console.log('Current URL:', attributes.url);
+        console.log('Path:', attributes.path);
+        console.log('Host:', attributes.host);
+        console.log('UTM Source:', attributes.utmSource);
+        console.log('Feature Count:', Object.keys(features).length);
+        console.log('Features:', features);
+        console.log('All Attributes:', attributes);
+        console.log('Context:', context);
+        console.groupEnd();
+      };
+      
+      window.gb.init({ 
+        streaming: true,
+        onFeatureError: function(error) {
+          console.error('[GrowthBook] Feature loading error:', error);
+          window.dispatchEvent(new CustomEvent('growthbook:error', {
+            detail: { error: error, type: 'feature_load' }
+          }));
+        }
+      }).then(function() {
+        if (window.performance && window.performance.mark) {
+          window.performance.mark('gb-init-complete');
+          window.performance.measure('gb-init-duration', 'gb-init-start', 'gb-init-complete');
+          
+          if (debugMode) {
+            const measure = window.performance.getEntriesByName('gb-init-duration')[0];
+            console.log('[GrowthBook Debug] Initialization took:', measure.duration.toFixed(2) + 'ms');
+          }
+        }
+        
+        const features = window.gb.getFeatures();
+        
+        console.log('[GrowthBook] Ready! Loaded ' + Object.keys(features).length + ' features');
+        
+        if (debugMode) {
+          console.log('[GrowthBook Debug] All available features:', Object.keys(features));
+        }
+        
+        const readyEvent = new CustomEvent('growthbook:ready', {
+          detail: {
+            ready: true,
+            projectId: projectId,
+            shopName: SHOP_NAME,
+            userId: window.gb.getAttributes().id,
+            sessionId: sessionStorage.getItem('gb_session_id') || 'session_' + Date.now(),
+            featureCount: Object.keys(features).length,
+            initDuration: window.performance ? 
+              (window.performance.getEntriesByName('gb-init-duration')[0] || {}).duration : null
+          }
+        });
+        document.dispatchEvent(readyEvent);
+        
+        window.growthbook = window.gb;
+        
+        if (window._gbReadyCallbacks) {
+          window._gbReadyCallbacks.forEach(cb => cb());
+          window._gbReadyCallbacks = [];
+        }
+        
+        // ============================================
+        // RUN VARIANT TESTS AFTER GROWTHBOOK IS READY
+        // ============================================
+        setTimeout(initVariantTests, 500);
+        
+      }).catch(function(error) {
+        console.error('[GrowthBook] Initialization error:', error);
+        
+        document.dispatchEvent(new CustomEvent('growthbook:error', {
+          detail: { 
+            error: error.toString(),
+            type: 'initialization',
+            projectId: projectId
+          }
+        }));
+        
+        if (window._gbReadyCallbacks) {
+          window._gbReadyCallbacks.forEach(cb => cb(error));
+          window._gbReadyCallbacks = [];
+        }
+      });
+      
+    } else {
+      console.error('[GrowthBook] SDK loaded but GrowthBook constructor not found');
+    }
+  };
+  
+  script.onerror = function(error) {
+    console.error('[GrowthBook] Failed to load SDK script:', error);
+    
+    document.dispatchEvent(new CustomEvent('growthbook:error', {
+      detail: { 
+        error: 'Failed to load SDK script',
+        type: 'script_load'
+      }
+    }));
+  };
+  
+  document.head.appendChild(script);
+  
+  // ============================================
+  // GLOBAL HELPER FUNCTIONS
+  // ============================================
+  
+  window.growthbook = {
+    ready: function(callback) {
+      if (window.gb && window.gb.getFeatures) {
+        callback();
+      } else {
+        window._gbReadyCallbacks = window._gbReadyCallbacks || [];
+        window._gbReadyCallbacks.push(callback);
+      }
+    },
+    debug: function() {
+      if (window.gb && window.gb.debug) {
+        window.gb.debug();
+      } else {
+        console.log('[GrowthBook] Not initialized yet. Try: growthbook.ready(() => gb.debug())');
+      }
+    }
+  };
+  
+  // Enhanced debug function to show exclusion reasons
+  window.debugVariantExperiments = function() {
+    if (!window.gb) {
+      console.error('[Variant Debug] GrowthBook not initialized');
+      return;
+    }
+    
+    console.group('🧪 Variant Experiments Debug');
+    
+    const projectId = window.gb.getAttributes().projectId;
+    console.log('Project ID:', projectId);
+    console.log('Shop Name:', SHOP_NAME);
+    console.log('User Attributes:', window.gb.getAttributes());
+    
+    const modifiedElements = document.querySelectorAll('[data-variant-experiment]');
+    console.log('Modified Elements:', modifiedElements.length);
+    
+    modifiedElements.forEach(el => {
+      console.log('Element:', el, {
+        experiment: el.getAttribute('data-variant-experiment'),
+        variant: el.getAttribute('data-variant-id'),
+        action: el.getAttribute('data-variant-action'),
+        forced: el.hasAttribute('data-variant-forced')
+      });
+    });
+    
+    console.groupEnd();
+  };
+  
+  window.testVariantTargeting = function(experimentId, condition) {
+    if (!window.gb) {
+      console.error('[Variant Debug] GrowthBook not initialized');
+      return;
+    }
+    
+    const attributes = window.gb.getAttributes();
+    console.group('🎯 Testing Targeting Condition');
+    console.log('Experiment ID:', experimentId);
+    console.log('User Attributes:', attributes);
+    console.log('Condition:', condition);
+    
+    let mongoCondition;
+    try {
+      mongoCondition = typeof condition === 'string' ? JSON.parse(condition) : condition;
+    } catch (e) {
+      console.error('Invalid JSON:', e);
+      console.groupEnd();
+      return;
+    }
+    
+    const result = evaluateMongoCondition(mongoCondition, attributes);
+    console.log('Result:', result ? '✅ MATCH' : '❌ NO MATCH');
+    console.groupEnd();
+    
+    return result;
+  };
+  
+  window.clearVariantData = function() {
+    console.log('[Variant Runner] Clearing all experiment data...');
+    
+    document.querySelectorAll('[data-variant-experiment]').forEach(el => {
+      ['data-variant-experiment', 'data-variant-action', 'data-variant-applied', 
+       'data-variant-forced', 'data-variant-original', 'data-variant-id',
+       'data-gb-experiment', 'data-variant-control', 'data-variant-removed'].forEach(attr => {
+        el.removeAttribute(attr);
+      });
+    });
+    
+    localStorage.removeItem('gb_active_tests');
+    localStorage.removeItem('gb_anonymous_id');
+    localStorage.removeItem('gb_debug');
+    sessionStorage.removeItem('gb_session_id');
+    
+    window._variantRunnerInitialized = false;
+    
+    console.log('[Variant Runner] Data cleared. Reloading...');
+    location.reload();
+  };
+  
+  // ✅ FIXED: Updated helper function to support multi-variant previews
+  window.testVariantPreview = function(experimentId) {
+    const baseUrl = window.location.origin + window.location.pathname;
+    console.group('🔗 Preview URLs for: ' + experimentId);
+    console.log('Control (0):', baseUrl + '?gb_' + experimentId + '=0');
+    console.log('Variant 1:', baseUrl + '?gb_' + experimentId + '=1');
+    console.log('Variant 2:', baseUrl + '?gb_' + experimentId + '=2');
+    console.log('Variant 3:', baseUrl + '?gb_' + experimentId + '=3');
+    console.log('Variant 4:', baseUrl + '?gb_' + experimentId + '=4');
+    console.log('\nCurrent URL params:', Object.fromEntries(urlParams.entries()));
+    console.groupEnd();
+  };
+  
+  // Session ID generation
+  (function() {
+    let sessionId = sessionStorage.getItem('gb_session_id');
+    if (!sessionId) {
+      sessionId = 'session_' + Math.random().toString(36).substr(2, 9) + '_' + Date.now();
+      sessionStorage.setItem('gb_session_id', sessionId);
+    }
+  })();
+  
+  // Debug mode persistence
+  if (urlParams.get('gb-debug') === 'true') {
+    localStorage.setItem('gb_debug', 'true');
+  } else if (urlParams.get('gb-debug') === 'false') {
+    localStorage.removeItem('gb_debug');
+  }
+  
+})();
+</script>
