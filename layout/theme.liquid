@@ -29,6 +29,23 @@
       src="https://cdn.jsdelivr.net/npm/@growthbook/growthbook/dist/bundles/auto.min.js"
     ></script>
 
+    <style>
+      .gb-loading {
+        overflow: hidden !important;
+      }
+      
+      .gb-loading .gb-hidden-content {
+        opacity: 0 !important;
+        visibility: hidden !important;
+      }
+      
+      .gb-content-ready .gb-hidden-content {
+        opacity: 1 !important;
+        visibility: visible !important;
+        transition: opacity 0.2s ease-in, visibility 0.2s ease-in;
+      }
+    </style>
+
     <meta charset="utf-8">
     <meta http-equiv="X-UA-Compatible" content="IE=edge">
     <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -272,14 +289,46 @@
     </script>
   </head>
 
-  <body class="gradient">
+  <body class="gradient gb-loading">
     <script>
-      // Wait for features to load
-      growthbook.on('ready', function() {
-        if (growthbook.isOn("special-banner")) {
+      function showContent() {
+        if (typeof growthbook !== 'undefined' && growthbook.isOn("special-banner")) {
           document.getElementById("special-banner").style.display = "block";
         }
-      });
+        
+        document.body.classList.remove('gb-loading');
+        document.body.classList.add('gb-content-ready');
+        enableScroll();
+      }
+      
+      function disableScroll() {
+        document.body.style.overflow = 'hidden';
+        document.documentElement.style.overflow = 'hidden';
+      }
+      
+      function enableScroll() {
+        document.body.style.overflow = '';
+        document.documentElement.style.overflow = '';
+      }
+      
+      disableScroll();
+      
+      if (typeof growthbook !== 'undefined' && growthbook.ready) {
+        showContent();
+      } else {
+        window.addEventListener('load', function() {
+          if (typeof growthbook !== 'undefined') {
+            growthbook.on('ready', showContent);
+          }
+        });
+      }
+      
+      setTimeout(function() {
+        if (document.body.classList.contains('gb-loading')) {
+          enableScroll();
+          showContent();
+        }
+      }, 3000);
     </script>
 
     <div id="special-banner" style="display:none;">
@@ -291,16 +340,22 @@
     </a>
 
     {%- if settings.cart_type == 'drawer' -%}
-      {%- render 'cart-drawer' -%}
+      <div class="gb-hidden-content">
+        {%- render 'cart-drawer' -%}
+      </div>
     {%- endif -%}
 
-    {% sections 'header-group' %}
+    <div class="gb-hidden-content">
+      {% sections 'header-group' %}
+    </div>
 
-    <main id="MainContent" class="content-for-layout focus-none" role="main" tabindex="-1">
+    <main id="MainContent" class="content-for-layout focus-none gb-hidden-content" role="main" tabindex="-1">
       {{ content_for_layout }}
     </main>
 
-    {% sections 'footer-group' %}
+    <div class="gb-hidden-content">
+      {% sections 'footer-group' %}
+    </div>
 
     <ul hidden>
       <li id="a11y-refresh-page-message">{{ 'accessibility.refresh_page' | t }}</li>
