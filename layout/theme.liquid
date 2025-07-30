@@ -292,8 +292,22 @@
   <body class="gradient gb-loading">
     <script>
       function showContent() {
-        if (typeof growthbook !== 'undefined' && growthbook.isOn("special-banner")) {
+        if (!document.body.classList.contains('gb-loading')) {
+          return;
+        }
+        
+        if (typeof growthbook !== 'undefined' && typeof growthbook.isOn === 'function' && growthbook.isOn("special-banner")) {
           document.getElementById("special-banner").style.display = "block";
+        }
+        
+        if (typeof window.gb !== 'undefined') {
+          try {
+            if (window.gb.isOn && window.gb.isOn("special-banner")) {
+              document.getElementById("special-banner").style.display = "block";
+            }
+          } catch (e) {
+            console.log(e)
+          }
         }
         
         document.body.classList.remove('gb-loading');
@@ -316,30 +330,68 @@
       document.body.classList.add('gb-loading');
       document.body.classList.remove('gb-content-ready');
       
+      window._gbReadyCallbacks = window._gbReadyCallbacks || [];
+      window._gbReadyCallbacks.push(function() {
+        showContent();
+      });
+      
       function initGrowthBook() {
-        if (typeof growthbook !== 'undefined') {
-          if (growthbook.ready) {
+        if (typeof window.gb !== 'undefined') {
+          if (window.gb.ready) {
             showContent();
           } else {
-            growthbook.on('ready', showContent);
+            if (typeof window.gb.ready === 'function') {
+              window.gb.ready(function() {
+                showContent();
+              });
+            }
+          }
+        }
+        else if (typeof growthbook !== 'undefined') {
+          if (typeof growthbook.ready === 'function') {
+            growthbook.ready(function() {
+              showContent();
+            });
+          } else if (growthbook.ready === true) {
+            showContent();
+          } else {
+            if (typeof growthbook.on === 'function') {
+              growthbook.on('ready', function() {
+                showContent();
+              });
+            }
           }
         }
       }
       
       initGrowthBook();
+      
       if (document.readyState === 'loading') {
-        document.addEventListener('DOMContentLoaded', initGrowthBook);
+        document.addEventListener('DOMContentLoaded', function() {
+          initGrowthBook();
+        });
       }
       
-      window.addEventListener('load', initGrowthBook);
-      setTimeout(initGrowthBook, 100);
+      window.addEventListener('load', function() {
+        initGrowthBook();
+      });
+      
+      setTimeout(function() {
+        initGrowthBook();
+      }, 100);
+      
+      setTimeout(function() {
+        if (document.body.classList.contains('gb-loading')) {
+          initGrowthBook();
+        }
+      }, 500);
       
       setTimeout(function() {
         if (document.body.classList.contains('gb-loading')) {
           enableScroll();
           showContent();
         }
-      }, 3000);
+      }, 1000);
     </script>
 
     <div id="special-banner" style="display:none;">
