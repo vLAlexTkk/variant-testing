@@ -313,15 +313,26 @@
       
       disableScroll();
       
-      if (typeof growthbook !== 'undefined' && growthbook.ready) {
-        showContent();
-      } else {
-        window.addEventListener('load', function() {
-          if (typeof growthbook !== 'undefined') {
+      document.body.classList.add('gb-loading');
+      document.body.classList.remove('gb-content-ready');
+      
+      function initGrowthBook() {
+        if (typeof growthbook !== 'undefined') {
+          if (growthbook.ready) {
+            showContent();
+          } else {
             growthbook.on('ready', showContent);
           }
-        });
+        }
       }
+      
+      initGrowthBook();
+      if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', initGrowthBook);
+      }
+      
+      window.addEventListener('load', initGrowthBook);
+      setTimeout(initGrowthBook, 100);
       
       setTimeout(function() {
         if (document.body.classList.contains('gb-loading')) {
