@@ -148,6 +148,14 @@
           "color_scheme": "background-1"
         }
       }
+    },
+    "content_for_index": [],
+    "blocks": {
+      "6259689876533155755": {
+        "type": "shopify://apps/adoric-bundles/blocks/bundle-embed/e20b8847-d680-41d1-b500-b783d925492a",
+        "disabled": false,
+        "settings": {}
+      }
     }
   },
   "presets": {
